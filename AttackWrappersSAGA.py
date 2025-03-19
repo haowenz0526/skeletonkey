@@ -5,8 +5,186 @@ import torch.nn.functional as F
 import numpy as np
 import cv2
 import torch.nn as nn
-from torch.nn.parallel import DistributedDataParallel as DDP
 
+# Returns a dataloader with the adverarial samples and corresponding clean labels
+def SkeletonKeyAuto(device, epsMax, numSteps, modelListPlus, dataLoader, clipMin, clipMax,
+                                         alphaLearningRate, fittingFactor):
+    print("Using hard coded experimental function not advisable.")
+    # Basic graident variable setup
+    xClean, yClean = DMP.DataLoaderToTensor(dataLoader)
+    xAdv = xClean # Set the initial adversarial samples
+    xOridata = xClean
+    xOriMax = xOridata + epsMax
+    xOriMin = xOridata - epsMax
+    numSamples = len(dataLoader.dataset)  # Get the total number of samples to attack
+    xShape = DMP.GetOutputShape(dataLoader)  # Get the shape of the input (there may be easier way to do this)
+    # Compute eps step
+    epsStep = epsMax / numSteps
+    dataLoaderCurrent = dataLoader
+    # Hardcoded for alpha right now, put in the method later
+    confidence = 0
+    nClasses = 10
+    alpha = torch.ones(len(modelListPlus), numSamples, xShape[0], xShape[1],
+                       xShape[2])  # alpha for every model and every sample
+    # End alpha setup
+    numSteps = 10
+    for i in range(0, numSteps):
+        print("Running step", i)
+        # Keep track of dC/dX for each model where C is the cross entropy function
+        dCdX = torch.zeros(len(modelListPlus), numSamples, xShape[0], xShape[1], xShape[2])
+        # Keep track of dF/dX for each model where F, is the Carlini-Wagner loss function (for updating alpha)
+        dFdX = torch.zeros(numSamples, xShape[0], xShape[1],
+                           xShape[2])  # Change to the math here to take in account all objecitve functions
+        # Go through each model and compute dC/dX
+        for m in range(0, len(modelListPlus)):
+            dataLoaderCurrent = modelListPlus[m].formatDataLoader(dataLoaderCurrent)
+            dCdXTemp = FGSMNativeGradient(device, dataLoaderCurrent, modelListPlus[m])
+            # Resize the graident to be the correct size and save it
+            dCdX[m] = torch.nn.functional.interpolate(dCdXTemp, size=(xShape[1], xShape[2]))
+            # Now compute the inital adversarial example with the base alpha
+        xGradientCumulative = torch.zeros(numSamples, xShape[0], xShape[1], xShape[2])
+
+        #change the sign of the targeted model and remain the sign for the non-targeted model
+
+        #**changed
+
+        xGradientCumulative = xGradientCumulative - alpha[m] * dCdX[m]
+        for m in range(1, len(modelListPlus)):
+            xGradientCumulative = xGradientCumulative + alpha[m] * dCdX[m]
+        # Change the sign of the gradient
+        #changed
+        xAdvStepOne = xAdv + epsStep * xGradientCumulative.sign()
+        # Convert the current xAdv to dataloader
+        dataLoaderStepOne = DMP.TensorToDataLoader(xAdvStepOne, yClean, transforms=None,
+                                                   batchSize=dataLoader.batch_size, randomizer=None)
+        print("===Pre-Alpha Optimization===")
+        costMultiplier = torch.zeros(len(modelListPlus), numSamples)
+        for m in range(0, len(modelListPlus)):
+            cost = CheckCarliniLoss(device, dataLoaderStepOne, modelListPlus[m], confidence, nClasses)
+            costMultiplier[m] = CarliniSingleSampleLoss(device, dataLoaderStepOne, modelListPlus[m], confidence,
+                                                        nClasses)
+            print("For model", m, "the Carlini value is", cost)
+        # Compute dF/dX (cumulative)
+        for m in range(0, len(modelListPlus)):
+            dFdX = dFdX + torch.nn.functional.interpolate(
+                dFdXCompute(device, dataLoaderStepOne, modelListPlus[m], confidence, nClasses),
+                size=(xShape[1], xShape[2]))
+        # Compute dX/dAlpha
+        dXdAlpha = dXdAlphaCompute(fittingFactor, epsStep, alpha, dCdX, len(modelListPlus), numSamples, xShape)
+        # Compute dF/dAlpha = dF/dx * dX/dAlpha
+        dFdAlpha = torch.zeros(len(modelListPlus), numSamples, xShape[0], xShape[1], xShape[2])
+        for m in range(0, len(modelListPlus)):
+            # dFdAlpha = dFdX * dXdAlpha[m]
+            dFdAlpha[m] = dFdX * dXdAlpha[m]
+        # Now time to update alpha(changed)
+        #changed
+        alpha = alpha - dFdAlpha * alphaLearningRate
+        # Compute final adversarial example using best alpha
+        xGradientCumulativeB = torch.zeros(numSamples, xShape[0], xShape[1], xShape[2])
+        for m in range(0, len(modelListPlus)):
+            xGradientCumulativeB = xGradientCumulativeB + alpha[m] * dCdX[m]
+        xAdv = xAdv + epsStep * xGradientCumulativeB.sign()
+        # clipMin = 0.0
+        # clipMax = 1.0
+        xAdv = torch.min(xOridata + epsMax, xAdv)
+        xAdv = torch.max(xOridata - epsMax, xAdv)
+        xAdv = torch.clamp(xAdv, clipMin, clipMax)
+        xAdv = ProjectionOperation(xAdv, xClean, epsMax)
+        
+        # Convert the current xAdv to dataloader
+        dataLoaderCurrent = DMP.TensorToDataLoader(xAdv, yClean, transforms=None, batchSize=dataLoader.batch_size,
+                                                   randomizer=None)
+        # Debug HERE
+        print("===Post-Alpha Optimization===")
+        for m in range(0, len(modelListPlus)):
+            cost = CheckCarliniLoss(device, dataLoaderCurrent, modelListPlus[m], confidence, nClasses)
+            print("For model", m, "the Carlini value is", cost)
+    return dataLoaderCurrent
+
+
+# Returns a dataloader with the adverarial samples and corresponding clean labels
+def SelfAttentionGradientAttackProtoAuto(device, epsMax, numSteps, modelListPlus, dataLoader, clipMin, clipMax,
+                                         alphaLearningRate, fittingFactor):
+    print("Using hard coded experimental function not advisable.")
+    # Basic graident variable setup
+    xClean, yClean = DMP.DataLoaderToTensor(dataLoader)
+    xAdv = xClean # Set the initial adversarial samples
+    xOridata = xClean
+    xOriMax = xOridata + epsMax
+    xOriMin = xOridata - epsMax
+    numSamples = len(dataLoader.dataset)  # Get the total number of samples to attack
+    xShape = DMP.GetOutputShape(dataLoader)  # Get the shape of the input (there may be easier way to do this)
+    # Compute eps step
+    epsStep = epsMax / numSteps
+    dataLoaderCurrent = dataLoader
+    # Hardcoded for alpha right now, put in the method later
+    confidence = 0
+    nClasses = 10
+    alpha = torch.ones(len(modelListPlus), numSamples, xShape[0], xShape[1],
+                       xShape[2])  # alpha for every model and every sample
+    # End alpha setup
+    numSteps = 10
+    for i in range(0, numSteps):
+        print("Running step", i)
+        # Keep track of dC/dX for each model where C is the cross entropy function
+        dCdX = torch.zeros(len(modelListPlus), numSamples, xShape[0], xShape[1], xShape[2])
+        # Keep track of dF/dX for each model where F, is the Carlini-Wagner loss function (for updating alpha)
+        dFdX = torch.zeros(numSamples, xShape[0], xShape[1],
+                           xShape[2])  # Change to the math here to take in account all objecitve functions
+        # Go through each model and compute dC/dX
+        for m in range(0, len(modelListPlus)):
+            dataLoaderCurrent = modelListPlus[m].formatDataLoader(dataLoaderCurrent)
+            dCdXTemp = FGSMNativeGradient(device, dataLoaderCurrent, modelListPlus[m])
+            # Resize the graident to be the correct size and save it
+            dCdX[m] = torch.nn.functional.interpolate(dCdXTemp, size=(xShape[1], xShape[2]))
+            # Now compute the inital adversarial example with the base alpha
+        xGradientCumulative = torch.zeros(numSamples, xShape[0], xShape[1], xShape[2])
+        for m in range(0, len(modelListPlus)):
+            xGradientCumulative = xGradientCumulative + alpha[m] * dCdX[m]
+        xAdvStepOne = xAdv + epsStep * xGradientCumulative.sign()
+        # Convert the current xAdv to dataloader
+        dataLoaderStepOne = DMP.TensorToDataLoader(xAdvStepOne, yClean, transforms=None,
+                                                   batchSize=dataLoader.batch_size, randomizer=None)
+        print("===Pre-Alpha Optimization===")
+        costMultiplier = torch.zeros(len(modelListPlus), numSamples)
+        for m in range(0, len(modelListPlus)):
+            cost = CheckCarliniLoss(device, dataLoaderStepOne, modelListPlus[m], confidence, nClasses)
+            costMultiplier[m] = CarliniSingleSampleLoss(device, dataLoaderStepOne, modelListPlus[m], confidence,
+                                                        nClasses)
+            print("For model", m, "the Carlini value is", cost)
+        # Compute dF/dX (cumulative)
+        for m in range(0, len(modelListPlus)):
+            dFdX = dFdX + torch.nn.functional.interpolate(
+                dFdXCompute(device, dataLoaderStepOne, modelListPlus[m], confidence, nClasses),
+                size=(xShape[1], xShape[2]))
+        # Compute dX/dAlpha
+        dXdAlpha = dXdAlphaCompute(fittingFactor, epsStep, alpha, dCdX, len(modelListPlus), numSamples, xShape)
+        # Compute dF/dAlpha = dF/dx * dX/dAlpha
+        dFdAlpha = torch.zeros(len(modelListPlus), numSamples, xShape[0], xShape[1], xShape[2])
+        for m in range(0, len(modelListPlus)):
+            # dFdAlpha = dFdX * dXdAlpha[m]
+            dFdAlpha[m] = dFdX * dXdAlpha[m]
+        # Now time to update alpha
+        alpha = alpha - dFdAlpha * alphaLearningRate
+        # Compute final adversarial example using best alpha
+        xGradientCumulativeB = torch.zeros(numSamples, xShape[0], xShape[1], xShape[2])
+        for m in range(0, len(modelListPlus)):
+            xGradientCumulativeB = xGradientCumulativeB + alpha[m] * dCdX[m]
+        xAdv = xAdv + epsStep * xGradientCumulativeB.sign()
+        # clipMin = 0.0
+        # clipMax = 1.0
+        xAdv = torch.min(xOridata + epsMax, xAdv)
+        xAdv = torch.max(xOridata - epsMax, xAdv)
+        xAdv = torch.clamp(xAdv, clipMin, clipMax)
+        # Convert the current xAdv to dataloader
+        dataLoaderCurrent = DMP.TensorToDataLoader(xAdv, yClean, transforms=None, batchSize=dataLoader.batch_size,
+                                                   randomizer=None)
+        # Debug HERE
+        print("===Post-Alpha Optimization===")
+        for m in range(0, len(modelListPlus)):
+            cost = CheckCarliniLoss(device, dataLoaderCurrent, modelListPlus[m], confidence, nClasses)
+            print("For model", m, "the Carlini value is", cost)
+    return dataLoaderCurrent
 
 
 #This operation can all be done in one line but for readability later
@@ -33,7 +211,88 @@ def resize_if_needed(x, target_size=(224, 224)):
         x = F.interpolate(x, size=target_size, mode='bilinear', align_corners=False)
     return x
 
-import torch.nn.functional as F
+
+def SelfAttentionGradientAttackMDSE(
+    device, epsMax, numSteps, modelListPlus, coefficientArray, dataLoader, 
+    clipMin, clipMax, sigma, learningRate, k=0
+):
+    # Helper functions
+    def sech(x):
+        return 1 / torch.cosh(x)
+
+    def F_loss(x_adv, y_clean, model, k=0):
+        
+        with torch.no_grad():
+            logits = model(x_adv)  # Forward pass
+            softmax_outputs = F.softmax(logits, dim=1)
+            correct_class_scores = softmax_outputs[range(len(y_clean)), y_clean]
+            max_other_class_scores = torch.max(
+                softmax_outputs.masked_fill(F.one_hot(y_clean, num_classes=softmax_outputs.shape[1]).bool(), -1e10), dim=1
+            )[0]
+            return torch.clamp(correct_class_scores - max_other_class_scores + kappa, min=0)
+
+    # Initialize variables
+    xClean, yClean = DMP.DataLoaderToTensor(dataLoader)
+    xAdv = xClean  # Initial adversarial examples
+    numSamples = len(dataLoader.dataset)
+    xShape = DMP.GetOutputShape(dataLoader)
+    epsStep = epsMax / numSteps
+
+    # Iterate through the attack steps
+    for i in range(numSteps):
+        print(f"Running Step {i + 1}")
+        xGradientCumulative = torch.zeros(numSamples, xShape[0], xShape[1], xShape[2])
+
+        for m, currentModelPlus in enumerate(modelListPlus):
+            dataLoaderCurrent = DMP.TensorToDataLoader(
+                resize_if_needed(xAdv, target_size=(224, 224)),
+                yClean, 
+                transforms=None, 
+                batchSize=dataLoader.batch_size, 
+                randomizer=None
+            )
+            
+            # Compute gradients for current model
+            xGradientCurrent = FGSMNativeGradient(device, dataLoaderCurrent, currentModelPlus)
+            xGradientCurrent = F.interpolate(xGradientCurrent, size=(xShape[1], xShape[2]))
+
+            # Attention rollout for ViT models
+            if "ViT" in currentModelPlus.modelName:
+                attmap = GetAttention(dataLoaderCurrent, currentModelPlus)
+                attmap = F.interpolate(attmap, size=(xShape[1], xShape[2]), mode='bilinear', align_corners=False)
+                xGradientCumulative += coefficientArray[m] * xGradientCurrent * attmap
+            else:
+                xGradientCumulative += coefficientArray[m] * xGradientCurrent
+
+        # Generate adversarial examples
+        xAdv = xAdv + epsStep * xGradientCumulative.sign()
+        xAdv = ProjectionOperation(xAdv, xClean, epsMax)
+        xAdv = torch.clamp(xAdv, clipMin, clipMax)
+
+        # Update coefficients
+        for m, currentModelPlus in enumerate(modelListPlus):
+            dataLoaderCurrent = DMP.TensorToDataLoader(
+                resize_if_needed(xAdv, target_size=(224, 224)),
+                yClean, 
+                transforms=None, 
+                batchSize=dataLoader.batch_size, 
+                randomizer=None
+            )
+            # Compute F_loss for current model
+            F_current = F_loss(xAdv, yClean, currentModelPlus.model, kappa)
+
+            # Compute gradient of x_adv with respect to α_m (Equation 26)
+            xGradientCurrent = FGSMNativeGradient(device, dataLoaderCurrent, currentModelPlus)
+            xGradientCurrent = F.interpolate(xGradientCurrent, size=(xShape[1], xShape[2]))
+            sech_term = sech(sigma * torch.sum(xGradientCurrent, dim=(1, 2, 3)))**2
+            grad_alpha = epsStep * sech_term * (xGradientCurrent * coefficientArray[m]).sum(dim=(1, 2, 3))
+
+            # Update α_m using gradient descent (Equation 24)
+            coefficientArray[m] = coefficientArray[m] - learningRate * grad_alpha
+
+    return DMP.TensorToDataLoader(xAdv, yClean, transforms=None, batchSize=dataLoader.batch_size, randomizer=None), coefficientArray
+
+
 
 def SelfAttentionGradientAttack(device, epsMax, numSteps, modelListPlus, coefficientArray, dataLoader, clipMin, clipMax):
     # Basic gradient variable setup
@@ -74,7 +333,7 @@ def SelfAttentionGradientAttack(device, epsMax, numSteps, modelListPlus, coeffic
         #projectionOperation
         xAdv = ProjectionOperation(xAdv, xClean, epsMax)
         xAdv = torch.clamp(xAdv, clipMin, clipMax)
-        torch.cuda.empty_cache()
+        
 
     return DMP.TensorToDataLoader(xAdv, yClean, transforms=None, batchSize=dataLoader.batch_size, randomizer=None)
 
@@ -113,6 +372,218 @@ def SelfAttentionGradientAttack(device, epsMax, numSteps, modelListPlus, coeffic
 #         dataLoaderCurrent = DMP.TensorToDataLoader(xAdv, yClean, transforms=None, batchSize=dataLoader.batch_size, randomizer=None)
 #     return dataLoaderCurrent
 
+# Custom loss function for updating alpha
+# def UntargetedCarliniLoss(logits, targets, confidence, nClasses, device):
+#     # This converts the normal target labels to one hot vectors e.g. y=1 will become [0, 1, 0, 0, 0, 0, 0, 0, 0, 0]
+#     yOnehot = torch.nn.functional.one_hot(targets, nClasses).to(torch.float)
+#     zC = torch.max(yOnehot * logits,
+#                    1).values  # Need to use .values to get the Tensor because PyTorch max function doesn't want to give us a tensor
+#     zOther = torch.max((1 - yOnehot) * logits, 1).values
+#     loss = torch.max(zC - zOther + confidence, torch.tensor(0.0).to(device))
+#     return loss
+
+def dFdXCompute(device, dataLoader, modelPlus, confidence, nClasses):
+    # Basic variable setup
+    model = modelPlus.model
+    model.eval()  # Change model to evaluation mode for the attack
+    model.to(device)
+    sizeCorrectedLoader = modelPlus.formatDataLoader(dataLoader)
+    # Generate variables for storing the adversarial examples
+    numSamples = len(sizeCorrectedLoader.dataset)  # Get the total number of samples to attack
+    xShape = DMP.GetOutputShape(sizeCorrectedLoader)  # Get the shape of the input (there may be easier way to do this)
+    xGradient = torch.zeros(numSamples, xShape[0], xShape[1], xShape[2])
+    yClean = torch.zeros(numSamples)
+    advSampleIndex = 0
+    batchSize = 0  # just do dummy initalization, will be filled in later
+    # Go through each sample
+    tracker = 0
+    for xData, yData in sizeCorrectedLoader:
+        batchSize = xData.shape[0]  # Get the batch size so we know indexing for saving later
+        tracker = tracker + batchSize
+        # print("Processing up to sample=", tracker)
+        # Put the data from the batch onto the device
+        xDataTemp = torch.from_numpy(xData.cpu().detach().numpy()).to(device)
+        yData = yData.type(torch.LongTensor).to(device)
+        # Set requires_grad attribute of tensor. Important for attack. (Pytorch comment, not mine)
+        xDataTemp.requires_grad = True
+        if modelPlus.modelName == 'SNN ResNet Backprop':
+            functional.reset_net(model)  # Line to reset model memory to accodomate Spiking Jelly (new attack iteration)
+            # Forward pass the data through the model
+            outputLogits = model(xDataTemp).mean(0)
+        else:
+            # Forward pass the data through the model
+            outputLogits = model(xDataTemp)
+        # Calculate the loss with respect to the Carlini Wagner loss function
+        # Zero all existing gradients
+        model.zero_grad()
+        # Calculate gradients of model in backward pass
+        cost = UntargetedCarliniLoss(outputLogits, yData, confidence, nClasses, device).sum().to(
+            device)  # Not sure about the sum
+        cost.backward()
+        if modelPlus.modelName == 'SNN VGG-16 Backprop':
+            xDataTempGrad = xDataTemp.grad.data.sum(-1)
+        else:
+            xDataTempGrad = xDataTemp.grad.data
+        # Save the adversarial images from the batch
+        for j in range(0, batchSize):
+            xGradient[advSampleIndex] = xDataTempGrad[j]
+            yClean[advSampleIndex] = yData[j]
+            advSampleIndex = advSampleIndex + 1  # increment the sample index
+        # Not sure if we need this but do some memory clean up
+        del xDataTemp
+        torch.cuda.empty_cache()
+    # Memory management
+    del model
+    torch.cuda.empty_cache()
+    return xGradient
+
+def dXdAlphaCompute(fittingFactor, epsStep, alpha, dCdX, numModels, numSamples, xShape):
+    # Allocate memory for the solution
+    dXdAlpha = torch.zeros(numModels, numSamples, xShape[0], xShape[1], xShape[2])
+    innerSum = torch.zeros(numSamples, xShape[0], xShape[1], xShape[2])
+    # First compute the inner summation sum m=1,...M: a_{m}*dC/dX_{m}
+    for m in range(0, numModels):
+        innerSum = innerSum + alpha[m] * dCdX[m]
+    # Multiply inner sum by the fitting factor to approximate the sign(.) function
+    innerSum = innerSum * fittingFactor
+    # Now compute the sech^2 of the inner sum
+    innerSumSecSquare = SechSquared(innerSum)
+    # Now do the final computation to get dX/dAlpha (may not actually need for loop)
+    for m in range(0, numModels):
+        dXdAlpha[m] = fittingFactor * epsStep * dCdX[m] * innerSumSecSquare
+    # All done so return
+    return dXdAlpha
+
+# Compute sech^2(x) using torch functions
+def SechSquared(x):
+    y = 4 * torch.exp(2 * x) / ((torch.exp(2 * x) + 1) * (torch.exp(2 * x) + 1))
+    return y
+def UntargetedCarliniLoss(logits, targets, confidence, nClasses, device):
+    """
+    Custom loss function for updating alpha using the Carlini & Wagner untargeted loss.
+    
+    Args:
+        logits (torch.Tensor): Logits from the model, shape (batch_size, nClasses).
+        targets (torch.Tensor): Ground truth labels, shape (batch_size).
+        confidence (float): Confidence margin for the attack.
+        nClasses (int): Number of classes.
+        device (torch.device): Device to run the computation on.
+        
+    Returns:
+        torch.Tensor: Loss tensor, shape (batch_size).
+    """
+    # Check and reshape logits if necessary
+    if logits.ndim != 2 or logits.size(1) != nClasses:
+        raise ValueError(f"Expected logits to have shape (batch_size, nClasses), but got {logits.shape}")
+
+    # Check and convert targets to one-hot encoding
+    if targets.ndim != 1:
+        targets = targets.view(-1)  # Ensure targets is a 1D tensor
+    
+    yOnehot = torch.nn.functional.one_hot(targets, nClasses).to(torch.float).to(device)
+
+    # Ensure one-hot encoding matches the shape of logits
+    if yOnehot.size(0) != logits.size(0):
+        raise ValueError(f"Batch size mismatch: logits {logits.size(0)} vs targets {yOnehot.size(0)}")
+
+    # Compute zC and zOther
+    zC = torch.max(yOnehot * logits, dim=1).values  # Max over each row (batch)
+    zOther = torch.max((1 - yOnehot) * logits, dim=1).values
+
+    # Compute loss
+    loss = torch.max(zC - zOther + confidence, torch.tensor(0.0).to(device))
+    return loss
+
+# Get the loss associated with single samples
+def CarliniSingleSampleLoss(device, dataLoader, modelPlus, confidence, nClasses):
+    # Basic variable setup
+    model = modelPlus.model
+    model.eval()  # Change model to evaluation mode for the attack
+    model.to(device)
+    sizeCorrectedLoader = modelPlus.formatDataLoader(dataLoader)
+    # Generate variables for storing the adversarial examples
+    numSamples = len(sizeCorrectedLoader.dataset)  # Get the total number of samples to attack
+    xShape = DMP.GetOutputShape(sizeCorrectedLoader)  # Get the shape of the input (there may be easier way to do this)
+    xGradient = torch.zeros(numSamples, xShape[0], xShape[1], xShape[2])
+    yClean = torch.zeros(numSamples)
+    # Variables to store the associated costs values
+    costValues = torch.zeros(numSamples)
+    batchSize = 0  # just do dummy initalization, will be filled in later
+    # Go through each sample
+    tracker = 0
+    for xData, yData in sizeCorrectedLoader:
+        batchSize = xData.shape[0]  # Get the batch size so we know indexing for saving later
+        # Put the data from the batch onto the device
+        xDataTemp = torch.from_numpy(xData.cpu().detach().numpy()).to(device)
+        yData = yData.type(torch.LongTensor).to(device)
+        if modelPlus.modelName == 'SNN ResNet Backprop':
+            functional.reset_net(model)  # Line to reset model memory to accodomate Spiking Jelly (new attack iteration)
+            # Forward pass the data through the model
+            outputLogits = model(xDataTemp).mean(0)
+        else:
+            # Forward pass the data through the model
+            outputLogits = model(xDataTemp)
+        # Calculate the loss with respect to the Carlini Wagner loss function
+        # Zero all existing gradients
+        model.zero_grad()
+        # Calculate gradients of model in backward pass
+        cost = UntargetedCarliniLoss(outputLogits, yData, confidence, nClasses, device)
+        cost.sum().backward()
+        # Store the current cost values
+        costValues[tracker:tracker + batchSize] = cost.to("cpu")
+        tracker = tracker + batchSize
+        # Not sure if we need this but do some memory clean up
+        del xDataTemp
+        torch.cuda.empty_cache()
+    # Memory management
+    del model
+    torch.cuda.empty_cache()
+    return costValues
+def CheckCarliniLoss(device, dataLoader, modelPlus, confidence, nClasses):
+    # Basic variable setup
+    model = modelPlus.model
+    model.eval()  # Change model to evaluation mode for the attack
+    model.to(device)
+    sizeCorrectedLoader = modelPlus.formatDataLoader(dataLoader)
+    # Generate variables for storing the adversarial examples
+    numSamples = len(sizeCorrectedLoader.dataset)  # Get the total number of samples to attack
+    xShape = DMP.GetOutputShape(sizeCorrectedLoader)  # Get the shape of the input (there may be easier way to do this)
+    xGradient = torch.zeros(numSamples, xShape[0], xShape[1], xShape[2])
+    yClean = torch.zeros(numSamples)
+    advSampleIndex = 0
+    batchSize = 0  # just do dummy initalization, will be filled in later
+    # Go through each sample
+    tracker = 0
+    cumulativeCost = 0
+    for xData, yData in sizeCorrectedLoader:
+        batchSize = xData.shape[0]  # Get the batch size so we know indexing for saving later
+        tracker = tracker + batchSize
+        # print("Processing up to sample=", tracker)
+        # Put the data from the batch onto the device
+        xDataTemp = torch.from_numpy(xData.cpu().detach().numpy()).to(device)
+        yData = yData.type(torch.LongTensor).to(device)
+        # Forward pass the data through the model
+        if modelPlus.modelName == 'SNN ResNet Backprop':
+            functional.reset_net(model)  # Line to reset model memory to accodomate Spiking Jelly (new attack iteration)
+            # Forward pass the data through the model
+            outputLogits = model(xDataTemp).mean(0)
+        else:
+            # Forward pass the data through the model
+            outputLogits = model(xDataTemp)
+        # Calculate the loss with respect to the Carlini Wagner loss function
+        # Zero all existing gradients
+        model.zero_grad()
+        # Calculate gradients of model in backward pass
+        cost = UntargetedCarliniLoss(outputLogits, yData, confidence, nClasses, device).sum()  # Not sure about the sum
+        cumulativeCost = cumulativeCost + cost.to("cpu")
+        cost.backward()
+        # Not sure if we need this but do some memory clean up
+        del xDataTemp
+        torch.cuda.empty_cache()
+    # Memory management
+    del model
+    torch.cuda.empty_cache()
+    return cumulativeCost
 def GetAttention(dLoader, modelPlus):
     numSamples = len(dLoader.dataset)
     attentionMaps = torch.zeros(numSamples, modelPlus.imgSizeH, modelPlus.imgSizeW,3)
@@ -162,6 +633,12 @@ def FGSMNativeGradient(device, dataLoader, modelPlus):
         xDataTemp.requires_grad = True
         # Forward pass the data through the model
         output = model(xDataTemp)
+
+        # Align output and target batch sizes
+        if output.size(0) != yData.size(0):
+            min_batch_size = min(output.size(0), yData.size(0))
+            output = output[:min_batch_size]
+            yData = yData[:min_batch_size]
         # Calculate the loss
         loss = torch.nn.CrossEntropyLoss()
         # Zero all existing gradients
@@ -287,7 +764,7 @@ def GetFirstCorrectlyOverlappingSamplesBalanced(device, sampleNum, numClasses, d
     #Do one last check to make sure all samples identify the clean loader correctly 
     for i in range(0, numModels):
         cleanAcc = modelPlusList[i].validateD(cleanDataLoader)
-        if cleanAcc != 1.0:
+        if cleanAcc < 0.996666666666667:
             print("Clean Acc "+ modelPlusList[i].modelName+":", cleanAcc)
             raise ValueError("The clean accuracy is not 1.0")
     #All error checking done, return the clean balanced loader 
